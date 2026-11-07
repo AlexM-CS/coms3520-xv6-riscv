@@ -15,6 +15,8 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+int logging = 0;
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -25,6 +27,61 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+int clamp(int x, int y, int z) {
+  if (x < y) x = y;
+  if (x > z) x = z;
+  return x;
+}
+
+int findProcIndexFromID(int pid) {
+    // find the process we want to modify
+  int i;
+  for (i = 0; i < NPROC; i++) {
+    if (proc[i].pid == pid) {
+      return i;
+    }
+  }
+    // invalid pid was given
+  return 0;
+}
+
+uint64 sys_startLogging(void) {
+  if (logging) {
+    printk("Logging is already enabled\n"); 
+  } else {
+    printk("Logging started\n");
+    logging = 1;
+  }
+  return 0;
+}
+
+uint64 sys_stopLogging(void) {
+  if (!logging) {
+    printk("Logging is not enabled\n"); 
+  } else {
+    printk("Logging stopped\n");
+    logging = 0;
+  }
+  return 0;
+}
+
+uint64 sys_nice(void) {
+  int pid;
+  int inc;
+    // set the arguments to the arguments passed by the user
+  argint(0, &pid);
+  argint(1, &inc);
+
+    // find the process we want to modify
+  int idx = findProcIndexFromID(pid);
+  if (!idx || proc[idx].state == UNUSED) return 0;
+
+    // update the process's nice value
+  proc[idx].nice = clamp(proc[idx].nice + inc, NICE_MIN, NICE_MAX);
+  if (logging) printk("nice set to %d for %d\n", proc[idx].nice, pid);
+  return proc[idx].nice;
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -168,6 +225,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->nice = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -442,26 +500,44 @@ scheduler(void)
     intr_off();
 
     int found = 0;
+      // declare these inside the loop so they are re-initialized every loop
+    struct proc *runThese[NPROC];
+    int runIDX = 0;
+    int nice = -19;
     for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
       if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+        // add RUNNABLE processes to an array of processes.
+        runThese[runIDX++] = p;
       }
-      release(&p->lock);
     }
+      // now that we have all the RUNNABLE processes, execute them based on their nice values
+    while (nice < 21) {
+      for (int i = 0; i < runIDX; i++) {
+        acquire(&runThese[i]->lock);
+          // if the nice value matches the current nice value, run the process
+        if (runThese[i]->nice == nice) {
+          // Switch to chosen process.  It is the process's job
+          // to release its lock and then reacquire it
+          // before jumping back to us.
+          runThese[i]->state = RUNNING;
+          c->proc = runThese[i];
+            // log that we had a process switch if logging is enabled
+          if (logging) printk("running %d at %d\n", runThese[i]->pid, ticks);
+          swtch(&c->context, &runThese[i]->context);
+
+          // Don't re-enable interrupts on release.
+          mycpu()->intena = 0;
+
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+          c->proc = 0;
+          found = 1;
+        }
+        release(&runThese[i]->lock);
+      }
+      nice++;
+    }
+    
     if (found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
